@@ -1,115 +1,713 @@
-// Cave Game relay server (WebSocket). Run:  npm i ws  &&  node server.js
-// Works behind any host that gives you HTTPS: clients connect with wss://your-host (port 443).
+// Cave Game account + multiplayer relay server.
+// Render runs this file. Neon stores accounts and revocable login sessions.
+// Required environment variable: DATABASE_URL
+// Optional first-owner bootstrap: OWNER_SETUP_KEY
+// Install: npm install && npm start
+
+'use strict';
+
 const http = require('http');
+const crypto = require('crypto');
+const { promisify } = require('util');
+const { Pool } = require('pg');
 const { WebSocketServer } = require('ws');
 
-const PORT = process.env.PORT || 8080;
-const MAX_PLAYERS = 16;          // per room
-const TICK_MS = 100;             // state broadcast rate (10 Hz): small + steady = Chromebook friendly
-const MAX_EDITS = 100000;        // per room (deduplicated by block position)
+const PORT = Number(process.env.PORT || 8080);
+const MAX_PLAYERS = 16;
+const TICK_MS = 100;
+const MAX_EDITS = 100000;
+const SESSION_DAYS = 14;
+const AUTH_RATE_LIMIT = 25;
+const AUTH_RATE_WINDOW = 15 * 60 * 1000;
+const BODY_LIMIT = 8 * 1024;
+const OWNER_SETUP_KEY = process.env.OWNER_SETUP_KEY || '';
 
+if (!process.env.DATABASE_URL) {
+  console.error('FATAL: DATABASE_URL is missing. Add the Neon pooled connection string in Render → Environment.');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 15000,
+  keepAlive: true
+});
+
+pool.on('error', (err) => console.error('Unexpected idle PostgreSQL error:', err.message));
+
+const scryptAsync = promisify(crypto.scrypt);
 const rooms = new Map();
+const authRates = new Map();
 let nextId = 1;
 
-// If cavegame.html sits next to this file, the same server hands the game out too:
-// one address (https://your-host/) for both the page and wss://your-host -- the easiest setup for a school network.
-const fs = require('fs'), path = require('path'), zlib = require('zlib');
-let gameRaw = null, gameGz = null;
-try { gameRaw = fs.readFileSync(path.join(__dirname, 'cavegame.html')); gameGz = zlib.gzipSync(gameRaw, { level: 9 }); } catch {}
-const server = http.createServer((req, res) => {
-  if (gameRaw && (req.url === '/' || req.url.startsWith('/?') || req.url.startsWith('/index'))) {
-    const gz = /gzip/.test(req.headers['accept-encoding'] || '');
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=300', ...(gz ? { 'content-encoding': 'gzip' } : {}) });
-    res.end(gz ? gameGz : gameRaw);
-    return;
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS accounts (
+  id BIGSERIAL PRIMARY KEY,
+  username TEXT NOT NULL,
+  username_norm TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'player'
+    CHECK (role IN ('owner', 'admin', 'moderator', 'player')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_login_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS account_sessions (
+  id BIGSERIAL PRIMARY KEY,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  token_hash CHAR(64) NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS account_sessions_account_id_idx ON account_sessions(account_id);
+CREATE INDEX IF NOT EXISTS account_sessions_expires_at_idx ON account_sessions(expires_at);
+`;
+
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function tokenHash(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function sendJson(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body)
+  });
+  res.end(body);
+}
+
+function cors(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '600');
+  res.setHeader('Vary', 'Origin');
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (Buffer.byteLength(raw) > BODY_LIMIT) {
+        reject(Object.assign(new Error('Request is too large.'), { status: 413 }));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        reject(Object.assign(new Error('Invalid JSON.'), { status: 400 }));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function rateAllowed(req, key) {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
+    .split(',')[0].trim();
+  const id = key + ':' + ip;
+  const now = Date.now();
+  let entry = authRates.get(id);
+
+  if (!entry || now - entry.start > AUTH_RATE_WINDOW) {
+    entry = { start: now, count: 0 };
   }
-  res.writeHead(200, { 'content-type': 'text/plain' });
-  res.end('Cave Game server is running\n');
+
+  entry.count++;
+  authRates.set(id, entry);
+  return entry.count <= AUTH_RATE_LIMIT;
+}
+
+function validUsername(value) {
+  if (typeof value !== 'string') {
+    throw Object.assign(new Error('Enter a username.'), { status: 400 });
+  }
+
+  const username = value.trim();
+
+  if (!/^[A-Za-z0-9_.-]{3,16}$/.test(username)) {
+    throw Object.assign(
+      new Error('Username must be 3–16 characters: letters, numbers, periods, underscores, or hyphens.'),
+      { status: 400 }
+    );
+  }
+
+  return { username, normalized: username.toLowerCase() };
+}
+
+function validPassword(value) {
+  if (typeof value !== 'string') {
+    throw Object.assign(new Error('Enter a password.'), { status: 400 });
+  }
+
+  const password = value;
+  const bytes = Buffer.byteLength(password, 'utf8');
+
+  if (bytes < 10) {
+    throw Object.assign(new Error('Password must be at least 10 characters.'), { status: 400 });
+  }
+
+  if (bytes > 128) {
+    throw Object.assign(new Error('Password must be 128 bytes or fewer.'), { status: 400 });
+  }
+
+  return password;
+}
+
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const derived = await scryptAsync(password, salt, 64, {
+    N: 16384,
+    r: 8,
+    p: 1,
+    maxmem: 64 * 1024 * 1024
+  });
+
+  return 'scrypt$' + salt.toString('base64url') + '$' +
+    Buffer.from(derived).toString('base64url');
+}
+
+async function verifyPassword(password, encoded) {
+  try {
+    const parts = String(encoded).split('$');
+
+    if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+
+    const salt = Buffer.from(parts[1], 'base64url');
+    const expected = Buffer.from(parts[2], 'base64url');
+
+    if (salt.length !== 16 || expected.length !== 64) return false;
+
+    const actual = Buffer.from(await scryptAsync(password, salt, 64, {
+      N: 16384,
+      r: 8,
+      p: 1,
+      maxmem: 64 * 1024 * 1024
+    }));
+
+    return crypto.timingSafeEqual(actual, expected);
+  } catch {
+    return false;
+  }
+}
+
+async function createSession(accountId) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000);
+
+  await pool.query(
+    'INSERT INTO account_sessions (account_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+    [accountId, tokenHash(token), expiresAt]
+  );
+
+  return token;
+}
+
+async function getAccountForToken(token) {
+  if (!token || typeof token !== 'string' || token.length > 200) return null;
+
+  const { rows } = await pool.query(
+    `SELECT a.id, a.username, a.role
+       FROM account_sessions s
+       JOIN accounts a ON a.id = s.account_id
+      WHERE s.token_hash = $1
+        AND s.revoked_at IS NULL
+        AND s.expires_at > NOW()
+      LIMIT 1`,
+    [tokenHash(token)]
+  );
+
+  return rows[0] || null;
+}
+
+function bearerToken(req) {
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+  return match ? match[1].trim() : '';
+}
+
+async function registerAccount(body) {
+  const { username, normalized } = validUsername(body.username);
+  const password = validPassword(body.password);
+  const ownerKey = typeof body.ownerKey === 'string' ? body.ownerKey : '';
+
+  if (body.ownerKey != null && typeof body.ownerKey !== 'string') {
+    throw Object.assign(new Error('Invalid owner setup key.'), { status: 400 });
+  }
+
+  const passwordHash = await hashPassword(password);
+  const client = await pool.connect();
+  let account;
+
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock($1)', [84612831]);
+
+    let role = 'player';
+
+    if (ownerKey) {
+      if (!OWNER_SETUP_KEY) {
+        throw Object.assign(
+          new Error('Owner setup is not enabled on the server. Add OWNER_SETUP_KEY in Render first.'),
+          { status: 503 }
+        );
+      }
+
+      if (!safeEqual(ownerKey, OWNER_SETUP_KEY)) {
+        throw Object.assign(new Error('Owner setup key is incorrect.'), { status: 403 });
+      }
+
+      const existingOwner = await client.query(
+        "SELECT id FROM accounts WHERE role = 'owner' LIMIT 1"
+      );
+
+      if (existingOwner.rowCount) {
+        throw Object.assign(new Error('An owner account has already been created.'), { status: 409 });
+      }
+
+      role = 'owner';
+    }
+
+    const result = await client.query(
+      `INSERT INTO accounts (username, username_norm, password_hash, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, username, role`,
+      [username, normalized, passwordHash, role]
+    );
+
+    account = result.rows[0];
+    await client.query('COMMIT');
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
+
+    if (err && err.code === '23505') {
+      throw Object.assign(new Error('That username is already taken.'), { status: 409 });
+    }
+
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const token = await createSession(account.id);
+  return { token, account };
+}
+
+async function loginAccount(body) {
+  const { normalized } = validUsername(body.username);
+  const password = validPassword(body.password);
+
+  const result = await pool.query(
+    'SELECT id, username, role, password_hash FROM accounts WHERE username_norm = $1 LIMIT 1',
+    [normalized]
+  );
+
+  const account = result.rows[0];
+
+  if (!account || !(await verifyPassword(password, account.password_hash))) {
+    throw Object.assign(new Error('Invalid username or password.'), { status: 401 });
+  }
+
+  await pool.query(
+    'UPDATE accounts SET last_login_at = NOW() WHERE id = $1',
+    [account.id]
+  );
+
+  const token = await createSession(account.id);
+
+  return {
+    token,
+    account: {
+      id: account.id,
+      username: account.username,
+      role: account.role
+    }
+  };
+}
+
+const server = http.createServer(async (req, res) => {
+  cors(req, res);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  const path = new URL(req.url, 'http://localhost').pathname;
+
+  try {
+    if (req.method === 'GET' && (path === '/' || path === '/health')) {
+      res.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-store'
+      });
+
+      return res.end('Cave Game account + multiplayer server is running\n');
+    }
+
+    if (req.method === 'GET' && path === '/api/health') {
+      await pool.query('SELECT 1');
+      return sendJson(res, 200, { ok: true, database: true });
+    }
+
+    if (req.method === 'POST' &&
+        (path === '/api/register' || path === '/api/login')) {
+      const action = path.endsWith('/register') ? 'register' : 'login';
+
+      if (!rateAllowed(req, action)) {
+        return sendJson(res, 429, {
+          ok: false,
+          error: 'Too many attempts. Please wait 15 minutes and try again.'
+        });
+      }
+
+      const body = await readJson(req);
+      const result = action === 'register'
+        ? await registerAccount(body)
+        : await loginAccount(body);
+
+      return sendJson(res, 200, {
+        ok: true,
+        token: result.token,
+        account: result.account
+      });
+    }
+
+    if (req.method === 'GET' && path === '/api/me') {
+      const account = await getAccountForToken(bearerToken(req));
+
+      if (!account) {
+        return sendJson(res, 401, {
+          ok: false,
+          error: 'Your session expired. Please sign in again.'
+        });
+      }
+
+      return sendJson(res, 200, { ok: true, account });
+    }
+
+    if (req.method === 'POST' && path === '/api/logout') {
+      const token = bearerToken(req);
+
+      if (token) {
+        await pool.query(
+          'UPDATE account_sessions SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL',
+          [tokenHash(token)]
+        );
+      }
+
+      return sendJson(res, 200, { ok: true });
+    }
+
+    return sendJson(res, 404, { ok: false, error: 'Not found.' });
+  } catch (err) {
+    const status = Number(err.status) || (err.code ? 503 : 500);
+
+    if (status >= 500) {
+      console.error('HTTP request failed:', err.message);
+    }
+
+    return sendJson(res, status, {
+      ok: false,
+      error: status === 500 ? 'Server error. Please try again.' : err.message
+    });
+  }
 });
-const wss = new WebSocketServer({ server, maxPayload: 16 * 1024, perMessageDeflate: { threshold: 512 } });
+
+const wss = new WebSocketServer({
+  server,
+  maxPayload: 16 * 1024,
+  perMessageDeflate: { threshold: 512 }
+});
 
 function room(name) {
   let r = rooms.get(name);
-  if (!r) { r = { clients: new Map(), edits: new Map() }; rooms.set(name, r); }
+
+  if (!r) {
+    r = { clients: new Map(), edits: new Map() };
+    rooms.set(name, r);
+  }
+
   return r;
 }
-const send = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
-const num = (v, lo, hi) => (Number.isFinite(+v) ? Math.min(hi, Math.max(lo, +v)) : 0);
+
+const send = (ws, o) => {
+  if (ws.readyState === 1) ws.send(JSON.stringify(o));
+};
+
+const num = (v, lo, hi) => {
+  return Number.isFinite(+v) ? Math.min(hi, Math.max(lo, +v)) : 0;
+};
 
 wss.on('connection', (ws) => {
-  ws.alive = true; ws.rate = 0; ws.room = null; ws.id = null; ws.state = null; ws.dirty = false; ws.needAll = false;
-  ws.on('pong', () => { ws.alive = true; });
-  ws.on('message', (buf) => {
-    if (++ws.rate > 80) return;                           // flood protection (80 msgs / second)
-    let m; try { m = JSON.parse(buf); } catch { return; }
-    if (!m || typeof m.t !== 'string') return;
+  ws.alive = true;
+  ws.rate = 0;
+  ws.room = null;
+  ws.id = null;
+  ws.state = null;
+  ws.dirty = false;
+  ws.needAll = false;
+  ws.joining = false;
+  ws.account = null;
 
-    if (m.t === 'h') {                                    // hello: join a room
-      if (ws.room) return;
-      const name = String(m.room || 'main').toLowerCase().replace(/[^a-z0-9_.-]/g, '').slice(0, 40) || 'main';
-      const r = room(name);
-      if (r.clients.size >= MAX_PLAYERS) { ws.close(1013, 'room full'); return; }
-      ws.room = r; ws.roomName = name; ws.id = 'p' + (nextId++);
-      ws.name = String(m.name || 'Player').replace(/[^\w .-]/g, '').slice(0, 16) || 'Player';
-      r.clients.set(ws.id, ws);
-      send(ws, { t: 'w', id: ws.id, n: r.clients.size });
-      const all = [...r.edits.values()];                  // late joiners get every edit so far
-      for (let i = 0; i < all.length; i += 400) send(ws, { t: 'e', l: all.slice(i, i + 400) });
-      ws.needAll = true;
+  ws.on('pong', () => {
+    ws.alive = true;
+  });
+
+  ws.authTimer = setTimeout(() => {
+    if (!ws.account && !ws.joining) {
+      ws.close(4001, 'authentication required');
+    }
+  }, 12000);
+
+  ws.on('message', async (buf) => {
+    if (++ws.rate > 80) return;
+
+    let m;
+    try {
+      m = JSON.parse(buf);
+    } catch {
       return;
     }
-    if (!ws.room) return;
 
-    if (m.t === 's' && m.s) {                             // player state
+    if (!m || typeof m.t !== 'string') return;
+
+    if (m.t === 'h') {
+      if (ws.room || ws.joining) return;
+
+      ws.joining = true;
+
+      try {
+        const account = await getAccountForToken(m.token);
+
+        if (ws.readyState !== 1) return;
+
+        if (!account) {
+          send(ws, {
+            t: 'a',
+            ok: false,
+            message: 'Please sign in again before joining multiplayer.'
+          });
+
+          ws.close(4001, 'authentication required');
+          return;
+        }
+
+        const name = String(m.room || 'main')
+          .toLowerCase()
+          .replace(/[^a-z0-9_.-]/g, '')
+          .slice(0, 40) || 'main';
+
+        const r = room(name);
+
+        if (r.clients.size >= MAX_PLAYERS) {
+          ws.close(1013, 'room full');
+          return;
+        }
+
+        clearTimeout(ws.authTimer);
+
+        ws.account = account;
+        ws.name = account.username;
+        ws.room = r;
+        ws.roomName = name;
+        ws.id = 'p' + (nextId++);
+
+        r.clients.set(ws.id, ws);
+
+        send(ws, {
+          t: 'w',
+          id: ws.id,
+          n: r.clients.size,
+          account: {
+            username: account.username,
+            role: account.role
+          }
+        });
+
+        const all = [...r.edits.values()];
+
+        for (let i = 0; i < all.length; i += 400) {
+          send(ws, { t: 'e', l: all.slice(i, i + 400) });
+        }
+
+        ws.needAll = true;
+      } catch (err) {
+        console.error('WebSocket authentication failed:', err.message);
+
+        send(ws, {
+          t: 'a',
+          ok: false,
+          message: 'Could not verify your account. Please try again.'
+        });
+
+        ws.close(1011, 'authentication check failed');
+      } finally {
+        ws.joining = false;
+      }
+
+      return;
+    }
+
+    if (!ws.room || !ws.account) return;
+
+    if (m.t === 's' && m.s) {
       const s = m.s;
-      ws.state = { n: ws.name, x: num(s.x, -3e7, 3e7), y: num(s.y, -64, 512), z: num(s.z, -3e7, 3e7),
-                   yw: num(s.yw, -10, 10), pt: num(s.pt, -2, 2), sk: String(s.sk || 'steve').replace(/[^a-z]/g, '').slice(0, 12), hd: num(s.hd, 0, 65535) | 0 };
+
+      ws.state = {
+        n: ws.name,
+        x: num(s.x, -3e7, 3e7),
+        y: num(s.y, -64, 512),
+        z: num(s.z, -3e7, 3e7),
+        yw: num(s.yw, -10, 10),
+        pt: num(s.pt, -2, 2),
+        sk: String(s.sk || 'steve').replace(/[^a-z]/g, '').slice(0, 12),
+        hd: num(s.hd, 0, 65535) | 0
+      };
+
       ws.dirty = true;
-    } else if (m.t === 'e' && Array.isArray(m.l)) {       // block edits
+
+    } else if (m.t === 'e' && Array.isArray(m.l)) {
       const out = [];
+
       for (const q of m.l.slice(0, 200)) {
         if (!Array.isArray(q) || q.length < 4) continue;
-        const x = q[0] | 0, y = q[1] | 0, z = q[2] | 0, v = q[3] | 0;
-        if (y < 0 || y > 255 || v < 0 || v > 65535 || Math.abs(x) > 3e7 || Math.abs(z) > 3e7) continue;
+
+        const x = q[0] | 0;
+        const y = q[1] | 0;
+        const z = q[2] | 0;
+        const v = q[3] | 0;
+
+        if (
+          y < 0 || y > 255 ||
+          v < 0 || v > 65535 ||
+          Math.abs(x) > 3e7 ||
+          Math.abs(z) > 3e7
+        ) continue;
+
         out.push([x, y, z, v]);
         ws.room.edits.set(x + ',' + y + ',' + z, [x, y, z, v]);
       }
-      if (ws.room.edits.size > MAX_EDITS) { const k = ws.room.edits.keys().next().value; ws.room.edits.delete(k); }
-      if (out.length) for (const c of ws.room.clients.values()) if (c !== ws) send(c, { t: 'e', l: out });
-    } else if (m.t === 'c' && typeof m.m === 'string') {  // chat
+
+      if (ws.room.edits.size > MAX_EDITS) {
+        const k = ws.room.edits.keys().next().value;
+        ws.room.edits.delete(k);
+      }
+
+      if (out.length) {
+        for (const c of ws.room.clients.values()) {
+          if (c !== ws) send(c, { t: 'e', l: out });
+        }
+      }
+
+    } else if (m.t === 'c' && typeof m.m === 'string') {
       const text = m.m.slice(0, 90);
-      for (const c of ws.room.clients.values()) if (c !== ws) send(c, { t: 'c', n: ws.name, m: text });
+
+      for (const c of ws.room.clients.values()) {
+        if (c !== ws) send(c, { t: 'c', n: ws.name, m: text });
+      }
     }
   });
+
   ws.on('close', () => {
+    clearTimeout(ws.authTimer);
+
     if (!ws.room) return;
+
     ws.room.clients.delete(ws.id);
-    for (const c of ws.room.clients.values()) send(c, { t: 'l', id: ws.id });
-    if (ws.room.clients.size === 0) rooms.delete(ws.roomName);   // empty rooms are forgotten
+
+    for (const c of ws.room.clients.values()) {
+      send(c, { t: 'l', id: ws.id });
+    }
+
+    if (ws.room.clients.size === 0) {
+      rooms.delete(ws.roomName);
+    }
   });
 });
 
-// one batched message per client per tick (only changed players)
+// One batched message per client per tick (only changed players).
 setInterval(() => {
   for (const r of rooms.values()) {
     const dirty = [];
-    for (const c of r.clients.values()) if (c.dirty && c.state) { dirty.push([c.id, c.state]); }
+
+    for (const c of r.clients.values()) {
+      if (c.dirty && c.state) dirty.push([c.id, c.state]);
+    }
+
     for (const c of r.clients.values()) {
       let list = dirty.filter((q) => q[0] !== c.id);
-      if (c.needAll) { list = [...r.clients.values()].filter((o) => o !== c && o.state).map((o) => [o.id, o.state]); c.needAll = false; }
+
+      if (c.needAll) {
+        list = [...r.clients.values()]
+          .filter((o) => o !== c && o.state)
+          .map((o) => [o.id, o.state]);
+
+        c.needAll = false;
+      }
+
       if (list.length) send(c, { t: 'p', l: list });
     }
+
     for (const c of r.clients.values()) c.dirty = false;
   }
 }, TICK_MS);
 
-// once a second: reset rate limits, drop dead connections
+// Reset rate limits, drop dead connections, and prune old auth throttles.
 setInterval(() => {
   for (const ws of wss.clients) {
     ws.rate = 0;
-    if (!ws.alive) { ws.terminate(); continue; }
-    ws.alive = false; try { ws.ping(); } catch {}
+
+    if (!ws.alive) {
+      ws.terminate();
+      continue;
+    }
+
+    ws.alive = false;
+
+    try {
+      ws.ping();
+    } catch {}
+  }
+
+  const cutoff = Date.now() - AUTH_RATE_WINDOW;
+
+  for (const [key, value] of authRates) {
+    if (value.start < cutoff) authRates.delete(key);
   }
 }, 1000);
 
-server.listen(PORT, () => console.log('Cave Game server listening on port ' + PORT));
+async function start() {
+  await pool.query('SELECT 1');
+  await pool.query(SCHEMA_SQL);
+
+  server.listen(PORT, () => {
+    console.log('Cave Game account + multiplayer server listening on port ' + PORT);
+  });
+}
+
+start().catch((err) => {
+  console.error('Could not start Cave Game server / initialize Neon:', err.message);
+  process.exit(1);
+});
+
+process.on('SIGTERM', async () => {
+  try {
+    await pool.end();
+  } catch {}
+
+  process.exit(0);
+});
