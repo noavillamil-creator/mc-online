@@ -3,7 +3,14 @@
   "version": "1.0.0",
   "description": "Cave Game WebSocket relay + game page",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.18.0" },
-  "engines": { "node": ">=18" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "pg": "^8.16.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
