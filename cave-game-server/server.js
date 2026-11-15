@@ -826,7 +826,7 @@ wss.on('connection', (ws, req) => {
       if (out.length) for (const c of r.clients.values()) if (c !== ws) send(c, { t: 'e', l: out });
     } else if (m.t === 'c' && typeof m.m === 'string') { // Room chat
       const now = Date.now(); if (now - ws.chatAt < 350) return; ws.chatAt = now;
-      const message = validChatText(m.m, 200); if (!message || message.startsWith('~#hit#~|')) return;
+      const message = validChatText(m.m, 200); if (!message) return;
       roomChat(r, { t: 'c', n: ws.name, m: message }, ws);
     } else if (m.t === 'pm') { // Private message: only within the current room
       const pmNow = Date.now(); if (pmNow - ws.chatAt < 350) return; ws.chatAt = pmNow;
